@@ -39,7 +39,7 @@ cmake-build-debug/PtraceInjectLoader
 ```sh
 /data/local/tmp/PtraceInjectLoader \
   --inject --pid 1234 /data/local/tmp/libexample.so \
-  --entry surface_tools_start
+  --entry module_entry
 ```
 
 指定的导出函数符号可以接收最多 8 个 AArch64 整数或指针参数：

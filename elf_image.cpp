@@ -4,6 +4,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <utility>
 
 namespace injector {
 namespace {
@@ -49,6 +50,11 @@ constexpr std::uint64_t kDtVerdef = 0x6ffffffc;
 constexpr std::uint64_t kDtVerdefNum = 0x6ffffffd;
 constexpr std::uint64_t kDtVerneed = 0x6ffffffe;
 constexpr std::uint64_t kDtVerneedNum = 0x6fffffff;
+constexpr std::uint32_t kRNone = 0;
+constexpr std::uint32_t kRAbs32 = 258;
+constexpr std::uint32_t kRAbs16 = 259;
+constexpr std::uint32_t kRPrel32 = 261;
+constexpr std::uint32_t kRPrel16 = 262;
 
 struct ProgramHeader {
     std::uint32_t type;
@@ -173,6 +179,17 @@ bool virtualRangeInMemory(const std::vector<LoadSegment>& segments,
             return true;
     }
     return false;
+}
+
+std::size_t relocationWidth(std::uint32_t type) {
+    switch (type) {
+    case kRNone: return 0;
+    case kRAbs16:
+    case kRPrel16: return sizeof(std::uint16_t);
+    case kRAbs32:
+    case kRPrel32: return sizeof(std::uint32_t);
+    default: return sizeof(std::uint64_t);
+    }
 }
 
 bool tableSymbolCount(const std::vector<std::uint8_t>& file,
@@ -464,7 +481,7 @@ bool parseElfImage(const std::vector<std::uint8_t>& file,
             image = {};
             return false;
         }
-        if (relaEntrySize != 0 && relaEntrySize != sizeof(RelaEntry)) {
+        if (relaSize != 0 && relaEntrySize != sizeof(RelaEntry)) {
             error = "unsupported DT_RELAENT size";
             image = {};
             return false;
@@ -571,8 +588,14 @@ bool parseElfImage(const std::vector<std::uint8_t>& file,
                     image = {};
                     return false;
                 }
-                image.symbols.push_back({std::string(begin, terminator), symbol.value, symbol.size,
-                                         symbol.info, symbol.other, symbol.sectionIndex});
+                DynamicSymbol parsedSymbol;
+                parsedSymbol.name = std::string(begin, terminator);
+                parsedSymbol.value = symbol.value;
+                parsedSymbol.size = symbol.size;
+                parsedSymbol.info = symbol.info;
+                parsedSymbol.other = symbol.other;
+                parsedSymbol.sectionIndex = symbol.sectionIndex;
+                image.symbols.push_back(std::move(parsedSymbol));
             }
             std::map<std::uint16_t, std::pair<std::string, std::string>> requiredVersions;
             std::map<std::uint16_t, std::string> definedVersions;
@@ -711,11 +734,12 @@ bool parseElfImage(const std::vector<std::uint8_t>& file,
                 return false;
             }
             for (const auto& relocation : image.relocations) {
+                const auto width = relocationWidth(relocation.type);
                 if (relocation.symbolIndex >= image.symbols.size() ||
-                    !virtualRangeInMemory(image.segments, relocation.offset, sizeof(std::uint64_t)) ||
+                    (width != 0 && !virtualRangeInMemory(image.segments, relocation.offset, width)) ||
                     relocation.offset < image.lowestPage ||
-                    relocation.offset - image.lowestPage > image.memory.size() ||
-                    sizeof(std::uint64_t) > image.memory.size() - (relocation.offset - image.lowestPage)) {
+                    (width != 0 && (relocation.offset - image.lowestPage > image.memory.size() ||
+                                    width > image.memory.size() - (relocation.offset - image.lowestPage)))) {
                     error = "relocation references an invalid symbol or image offset";
                     image = {};
                     return false;

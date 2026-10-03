@@ -153,7 +153,9 @@ bool inspectPayload(const std::string& path) {
 
 bool isEntryFunction(const injector::DynamicSymbol& symbol, const std::string& name) {
     const auto type = symbol.info & 0x0f;
-    return symbol.name == name && symbol.sectionIndex != 0 && (type == 2 || type == 10);
+    const auto binding = symbol.info >> 4;
+    return symbol.name == name && symbol.sectionIndex != 0 &&
+           (binding == 1 || binding == 2) && (type == 2 || type == 10);
 }
 
 bool injectPayload(int pid, const std::string& path, const std::string& entryName,

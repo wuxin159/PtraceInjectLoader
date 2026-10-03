@@ -33,7 +33,7 @@ Inject into a selected process as root:
 ```sh
 /data/local/tmp/PtraceInjectLoader \
   --inject --pid 1234 /data/local/tmp/libexample.so \
-  --entry surface_tools_start
+  --entry module_entry
 ```
 
 The entry arguments are optional AArch64 integer/pointer values passed to the exported function symbol:

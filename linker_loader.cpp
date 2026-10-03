@@ -18,10 +18,6 @@ namespace {
 constexpr std::uint64_t kPageSize = 4096;
 constexpr std::size_t kMaxPayloadSize = 128 * 1024 * 1024;
 constexpr std::size_t kScratchSize = 64 * 1024;
-constexpr std::size_t kWriteChunkSize = 48 * 1024;
-constexpr std::uint64_t kMemfdCloexec = 1;
-constexpr std::uint64_t kAndroidDlextUseLibraryFd = 0x10;
-constexpr std::uint64_t kAndroidDlextForceLoad = 0x40;
 constexpr std::uint64_t kRtldNow = 2;
 constexpr std::uint64_t kRtldGlobal = 0x100;
 
@@ -37,16 +33,7 @@ constexpr std::uint32_t kRRelative = 1027;
 constexpr std::uint32_t kRIrelative = 1032;
 constexpr std::uint32_t kRNone = 0;
 constexpr std::uint8_t kSttGnuIfunc = 10;
-
-struct AndroidDlextInfo64 {
-    std::uint64_t flags;
-    std::uint64_t reservedAddress;
-    std::uint64_t reservedSize;
-    std::int32_t relroFd;
-    std::int32_t libraryFd;
-    std::int64_t libraryFdOffset;
-    std::uint64_t libraryNamespace;
-};
+constexpr std::uint16_t kShnAbs = 0xfff1;
 
 std::string canonicalMapPath(const MemoryMap& map) {
     std::string path = map.path;
@@ -55,20 +42,6 @@ std::string canonicalMapPath(const MemoryMap& map) {
         path.compare(path.size() - (sizeof(suffix) - 1), sizeof(suffix) - 1, suffix) == 0)
         path.resize(path.size() - (sizeof(suffix) - 1));
     return path;
-}
-
-std::string baseName(const std::string& path) {
-    const auto slash = path.find_last_of('/');
-    return slash == std::string::npos ? path : path.substr(slash + 1);
-}
-
-std::uint64_t hashBytes(const std::vector<std::uint8_t>& bytes) {
-    std::uint64_t hash = 14695981039346656037ull;
-    for (const auto byte : bytes) {
-        hash ^= byte;
-        hash *= 1099511628211ull;
-    }
-    return hash;
 }
 
 bool readElfFile(const std::string& path, std::vector<std::uint8_t>& bytes, std::string& error) {
@@ -128,16 +101,6 @@ bool readRemoteString(TargetProcess& target, std::uint64_t address,
     return false;
 }
 
-bool closeRemoteFd(TargetProcess& target, int tid, int fd, std::string& error) {
-    if (fd < 0)
-        return true;
-    std::int64_t result = -1;
-    if (!target.remoteSyscall(tid, __NR_close,
-                              {static_cast<std::uint64_t>(fd), 0, 0, 0, 0, 0}, result, error))
-        return false;
-    return result == 0;
-}
-
 bool linkerError(TargetProcess& target, const ResolvedTargetSymbol& dlerror,
                  std::string& error) {
     std::int64_t pointer = 0;
@@ -159,6 +122,24 @@ bool addSignedOffset(std::uint64_t base, std::int64_t delta, std::uint64_t& resu
     if (base < amount)
         return false;
     result = base - amount;
+    return true;
+}
+
+bool calculateSignedRelative(std::uint64_t symbol,
+                             std::int64_t addend,
+                             std::uint64_t place,
+                             unsigned bits,
+                             std::uint64_t& encoded) {
+    const __int128 value = static_cast<__int128>(symbol) +
+                           static_cast<__int128>(addend) -
+                           static_cast<__int128>(place);
+    const __int128 minimum = -(__int128{1} << (bits - 1));
+    const __int128 maximum = (__int128{1} << (bits - 1)) - 1;
+    if (value < minimum || value > maximum)
+        return false;
+    const std::uint64_t mask = bits == 64 ? std::numeric_limits<std::uint64_t>::max()
+                                          : (std::uint64_t{1} << bits) - 1;
+    encoded = static_cast<std::uint64_t>(value) & mask;
     return true;
 }
 
@@ -555,11 +536,12 @@ bool loadWithTargetMemory(TargetProcess& target,
         }
         const auto& symbol = payloadElf.symbols[static_cast<std::size_t>(index)];
         if (symbol.sectionIndex != 0) {
-            if (symbol.value > std::numeric_limits<std::uint64_t>::max() - loadBias) {
+            if (symbol.sectionIndex != kShnAbs &&
+                symbol.value > std::numeric_limits<std::uint64_t>::max() - loadBias) {
                 error = "defined symbol address overflow";
                 return false;
             }
-            value = loadBias + symbol.value;
+            value = symbol.sectionIndex == kShnAbs ? symbol.value : loadBias + symbol.value;
             if ((symbol.info & 0x0f) == kSttGnuIfunc && !invokeIfunc(value, value))
                 return false;
         } else {
@@ -573,9 +555,18 @@ bool loadWithTargetMemory(TargetProcess& target,
                 std::int64_t resolved = 0;
                 std::string callError;
                 bool found = false;
-                const bool hasVersion = !symbol.versionName.empty() && hasDlvsym &&
-                    symbol.versionName.size() + 1 <= 4096 &&
-                    target.writeMemory(versionAddress, symbol.versionName.c_str(), symbol.versionName.size() + 1);
+                const bool needsVersion = !symbol.versionName.empty();
+                if (needsVersion && !hasDlvsym) {
+                    error = "versioned symbol requires target dlvsym: " + symbol.name;
+                    return false;
+                }
+                if (needsVersion && (symbol.versionName.size() + 1 > 4096 ||
+                                     !target.writeMemory(versionAddress, symbol.versionName.c_str(),
+                                                         symbol.versionName.size() + 1))) {
+                    error = "failed to write symbol version name";
+                    return false;
+                }
+                const bool hasVersion = needsVersion;
                 auto tryDependency = [&](const std::pair<std::string, std::uint64_t>& dependency) {
                     if (hasVersion) {
                         std::int64_t candidate = 0;
@@ -585,6 +576,7 @@ bool loadWithTargetMemory(TargetProcess& target,
                             resolved = candidate;
                             return true;
                         }
+                        return false;
                     }
                     std::int64_t candidate = 0;
                     if (target.remoteCall(tid, dlsym.address,
@@ -611,13 +603,13 @@ bool loadWithTargetMemory(TargetProcess& target,
                         }
                     }
                 }
-                if (!found && hasVersion) {
+                if (!found && needsVersion) {
                     target.remoteCall(tid, dlvsym.address,
                         {0, nameAddress, versionAddress, 0, 0, 0, 0, 0},
                         resolved, callError);
                     found = resolved != 0;
                 }
-                if (!found) {
+                if (!found && !needsVersion) {
                     target.remoteCall(tid, dlsym.address,
                         {0, nameAddress, 0, 0, 0, 0, 0, 0},
                         resolved, callError);
@@ -673,9 +665,8 @@ bool loadWithTargetMemory(TargetProcess& target,
         case kRPrel64:
             if (!resolveSymbol(relocation.symbolIndex, symbolValue))
                 return fail(error);
-            if (!addSignedOffset(symbolValue, relocation.addend, relocated) || relocated < destination)
-                return fail("R_AARCH64_PREL64 addend overflow");
-            relocated -= destination;
+            if (!calculateSignedRelative(symbolValue, relocation.addend, destination, 64, relocated))
+                return fail("R_AARCH64_PREL64 value overflow");
             break;
         case kRAbs32: {
             if (!resolveSymbol(relocation.symbolIndex, symbolValue))
@@ -705,10 +696,9 @@ bool loadWithTargetMemory(TargetProcess& target,
             if (!resolveSymbol(relocation.symbolIndex, symbolValue))
                 return fail(error);
             std::uint64_t relative = 0;
-            if (!addSignedOffset(symbolValue, relocation.addend, relative) || relative < destination ||
-                relative - destination > UINT32_MAX)
+            if (!calculateSignedRelative(symbolValue, relocation.addend, destination, 32, relative))
                 return fail("R_AARCH64_PREL32 value overflow");
-            const auto value32 = static_cast<std::uint32_t>(relative - destination);
+            const auto value32 = static_cast<std::uint32_t>(relative);
             if (!target.writeMemory(destination, &value32, sizeof(value32)))
                 return fail("failed to write R_AARCH64_PREL32 relocation");
             ++appliedByType[relocation.type];
@@ -718,10 +708,9 @@ bool loadWithTargetMemory(TargetProcess& target,
             if (!resolveSymbol(relocation.symbolIndex, symbolValue))
                 return fail(error);
             std::uint64_t relative = 0;
-            if (!addSignedOffset(symbolValue, relocation.addend, relative) || relative < destination ||
-                relative - destination > UINT16_MAX)
+            if (!calculateSignedRelative(symbolValue, relocation.addend, destination, 16, relative))
                 return fail("R_AARCH64_PREL16 value overflow");
-            const auto value16 = static_cast<std::uint16_t>(relative - destination);
+            const auto value16 = static_cast<std::uint16_t>(relative);
             if (!target.writeMemory(destination, &value16, sizeof(value16)))
                 return fail("failed to write R_AARCH64_PREL16 relocation");
             ++appliedByType[relocation.type];
@@ -765,14 +754,18 @@ bool loadWithTargetMemory(TargetProcess& target,
 
     const auto entry = std::find_if(payloadElf.symbols.begin(), payloadElf.symbols.end(),
         [&](const DynamicSymbol& symbol) {
+            const auto binding = symbol.info >> 4;
+            const auto type = symbol.info & 0x0f;
             return symbol.name == entryName && symbol.sectionIndex != 0 &&
-                   (symbol.info >> 4) == 1 && (symbol.info & 0x0f) == 2;
+                   (binding == 1 || binding == 2) &&
+                   (type == 2 || type == kSttGnuIfunc);
         });
     if (entry == payloadElf.symbols.end())
         return fail("payload entry symbol not found: " + entryName);
-    if (entry->value > std::numeric_limits<std::uint64_t>::max() - loadBias)
+    if (entry->sectionIndex != kShnAbs &&
+        entry->value > std::numeric_limits<std::uint64_t>::max() - loadBias)
         return fail("payload entry address overflow");
-    std::uint64_t entryAddress = loadBias + entry->value;
+    std::uint64_t entryAddress = entry->sectionIndex == kShnAbs ? entry->value : loadBias + entry->value;
     if ((entry->info & 0x0f) == kSttGnuIfunc && !invokeIfunc(entryAddress, entryAddress))
         return fail(error);
     if (!target.remoteCall(tid, entryAddress, entryArgs, entryResult, error))
